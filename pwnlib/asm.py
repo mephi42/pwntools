@@ -62,7 +62,7 @@ from pwnlib.log import getLogger
 
 log = getLogger(__name__)
 
-__all__ = ['asm', 'cpp', 'disasm', 'make_elf', 'make_elf_from_assembly']
+__all__ = ['asm', 'cc', 'cpp', 'disasm', 'make_elf', 'make_elf_from_assembly']
 
 _basedir = path.split(__file__)[0]
 _incdir  = path.join(_basedir, 'data', 'includes')
@@ -824,6 +824,138 @@ def asm(shellcode, vma = 0, extract = True, shared = False):
         atexit.register(lambda: shutil.rmtree(tmpdir))
 
     return result
+
+
+@LocalContext
+def cc(shellcode, vma=None, cflags=None):
+    r"""cc(shellcode, ...) -> bytes
+
+    Runs a C compiler over a given shellcode and then assembles it into bytes.
+    The entry point must be called _start(); it may have any signature. It will
+    be placed into the first shellcode byte; the other functions and variables
+    will be placed after it.
+
+    It is allowed to use the system headers, but dynamically linking libc is
+    not. Consider using nolibc if you need to invoke linux syscalls.
+
+    To see which architectures or operating systems are supported,
+    look in :mod:`pwnlib.context`.
+
+    Assembling shellcode requires that the GNU Compiler Collection is installed
+    for the target architecture.
+
+    Arguments:
+        shellcode(str): C code to compile and assemble.
+        vma(int):       Virtual memory address of the beginning of assembly;
+                        by default position-independent code will be generated.
+        cflags(str):    Array containing additional C compiler flags.
+        kwargs(dict):   Any attributes on :data:`.context` can be set, e.g.,
+                        ``arch='arm'``.
+
+    Examples:
+
+        >>> cc('''\
+        ... #include <sys/syscall.h>
+        ... int _start(void) { return SYS_select; }
+        ... ''', arch='amd64', os='linux')
+        b'\xb8\x17\x00\x00\x00\xc3'
+        >>> cc('''\
+        ... #include <sys/syscall.h>
+        ... int _start(void) { return SYS__newselect; }
+        ... ''', arch='arm', os='linux', bits=32)
+        b'\x8e\x00\xa0\xe3\x1e\xff/\xe1'
+        >>> cc('''\
+        ... int magic = FOURTY_TWO;
+        ... int _start(void) { return magic; }
+        ... ''', vma=0x5858, cflags=['-DFOURTY_TWO=42'], arch='msp430')
+        b'\x1fB^X0A*\x00'
+        >>> cc('''\
+        ... const char *_start(void) { return "hello s390x"; }
+        ... ''', arch='s390', os='linux', bits=64)
+        b'\xc0 \x00\x00\x00\x04\x07\xfehello s390x\x00'
+    """
+    gcc = which_binutils('gcc')
+    objcopy = _objcopy()
+    tmpdir = tempfile.mkdtemp(prefix='pwn-cc-')
+    try:
+        conftest_c = path.join(tmpdir, 'conftest.c')
+
+        def is_cflag_supported(cflag):
+            with open(conftest_c, 'w') as conftest:
+                conftest.write('int main(void) { return 0; }')
+                conftest.flush()
+                conftest.seek(0)
+                with open('/dev/null', 'r+b') as devnull:
+                    argv = [
+                        gcc, cflag, '-x', 'c', conftest_c, '-o', '/dev/null']
+                    status = subprocess.call(
+                        argv, stdin=devnull, stdout=devnull, stderr=devnull)
+                    return status == 0
+
+        if is_cflag_supported('-fcf-protection=none'):
+            fcf_protection_none = ['-fcf-protection=none']
+        else:
+            fcf_protection_none = []
+        if vma is None:
+            if is_cflag_supported('-fPIE'):
+                fpie_or_vma = ['-fPIE']
+            else:
+                raise RuntimeError('-fPIE is not supported and vma is None')
+        else:
+            fpie_or_vma = ['-Wl,--section-start=.shellcode=0x{:x}'.format(vma)]
+        if is_cflag_supported('-Wl,--build-id=none'):
+            build_id_none = ['-Wl,--build-id=none']
+        else:
+            build_id_none = []
+
+        shellcode_c = path.join(tmpdir, 'shellcode.c')
+        with open(shellcode_c, 'w') as fd:
+            fd.write(shellcode)
+        shellcode_lds = path.join(tmpdir, 'shellcode.lds')
+        with open(shellcode_lds, 'w') as fd:
+            fd.write('''\
+SECTIONS {
+    .shellcode : {
+        *(.text._start)
+        *(.text*)
+        *(.rodata*)
+        *(.data*)
+    }
+    /DISCARD/ : { *(*) }
+}
+''')
+        shellcode_elf = path.join(tmpdir, 'shellcode.elf')
+        subprocess.check_call([
+            gcc,
+        ] + fcf_protection_none + [
+            '-ffreestanding',
+            '-ffunction-sections',
+            '-fno-stack-protector',
+        ] + fpie_or_vma + [
+            '-nostdlib',
+            '-Os',
+            '-Wall', '-Wextra', '-Werror',
+        ] + build_id_none + [
+            '-Wl,-script={}'.format(shellcode_lds),
+            shellcode_c,
+            '-o', shellcode_elf,
+        ] + ([] if cflags is None else cflags))
+        shellcode_bin = path.join(tmpdir, 'shellcode.bin')
+        subprocess.check_call(objcopy + [
+            '-O', 'binary',
+            '--only-section=.shellcode',
+            shellcode_elf, shellcode_bin,
+        ])
+        with open(shellcode_bin, 'rb') as fp:
+            return fp.read()
+    except Exception:
+        log.exception('An error occurred while compiling:\n{}'.format(
+            '\n'.join(
+                '{:4d}: {}'.format(i + 1, line)
+                for (i, line) in enumerate(shellcode.splitlines()))))
+    else:
+        atexit.register(lambda: shutil.rmtree(tmpdir))
+
 
 @LocalContext
 def disasm(data, vma = 0, byte = True, offset = True, instructions = True):
